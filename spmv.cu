@@ -350,14 +350,14 @@ int main(int argc, char **argv)
     CHECK_CUSPARSE( cusparseSpMV_bufferSize(
                                  handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
                                  &alpha, matA, vecX, &beta, vecY, CUDA_R_32F,
-                                 CUSPARSE_MV_ALG_DEFAULT, &bufferSize) )
+                                 CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize) )
     CHECK_CUDA( cudaMalloc(&dBuffer, bufferSize) )
 
     // execute SpMV
     for(int i=0; i<iter; i++){
         CHECK_CUSPARSE( cusparseSpMV(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
                                     &alpha, matA, vecX, &beta, vecY, CUDA_R_32F,
-                                    CUSPARSE_MV_ALG_DEFAULT, dBuffer) )
+                                    CUSPARSE_SPMV_ALG_DEFAULT, dBuffer) )
     }
 
     // destroy matrix/vector descriptors

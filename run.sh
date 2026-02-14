@@ -6,7 +6,6 @@
 #BSUB -gpu "num=1:mode=shared:mps=no"
 #BSUB -o out.%J
 #BSUB -e err.%J
-module load PrgEnv-gnu
 module load cuda
 
 nvcc spmv.cu -o spmv -lcusparse
