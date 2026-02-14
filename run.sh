@@ -9,4 +9,4 @@
 module load cuda
 
 nvcc spmv.cu -o spmv -lcusparse
-./spmv -f test
+./spmv -f shyy41
