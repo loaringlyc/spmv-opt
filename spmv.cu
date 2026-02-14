@@ -44,6 +44,7 @@ void add(int a, int b, float c,
     e[idx] = b, w[idx] = c, ne[idx] = h[a], h[a] = idx++;
 }
 
+// get basic information of the matrix
 void readVerEdges(int &is_weighted, int &n, int &t, int &m, std::string &file)
 {
     std::ifstream input;
@@ -76,6 +77,7 @@ void readVerEdges(int &is_weighted, int &n, int &t, int &m, std::string &file)
     input.close();
 }
 
+// read matrix and store into CSR form
 void readMtxFile(int is_weighted, int n, int m,
             int *row_offset, int *col_index, float *val,
             std::string &file)
@@ -148,6 +150,7 @@ void readMtxFile(int is_weighted, int n, int m,
     free(w);
 }
 
+// device end tool
 template <unsigned int WarpSize>
 __device__ __forceinline__ float warpReduceSum(float sum) {
     if (WarpSize >= 32)sum += __shfl_down_sync(0xffffffff, sum, 16); // 0-16, 1-17, 2-18, etc.
@@ -158,6 +161,7 @@ __device__ __forceinline__ float warpReduceSum(float sum) {
     return sum;
 }
 
+// core GPU kernel
 template <typename IndexType, typename ValueType, unsigned int VECTORS_PER_BLOCK, unsigned int THREADS_PER_VECTOR>
 __global__ void My_spmv_csr_kernel(const IndexType row_num,
                        const IndexType * A_row_offset,
@@ -197,6 +201,7 @@ void vec_print(vector<T> array){
     cout<<std::endl;
 }
 
+// reference CPU implementation
 template <typename IndexType, typename ValueType>
 void spmv_cpu_kernel(vector<IndexType> &row_offset,
                 vector<IndexType> &col_index,
@@ -215,6 +220,7 @@ void spmv_cpu_kernel(vector<IndexType> &row_offset,
         y[i] = res;
     }
 }
+
 
 int main(int argc, char **argv)
 {
@@ -278,6 +284,14 @@ int main(int argc, char **argv)
     // 32 thread for a row
     int mean_col_num = (nnz_num + (row_num - 1))/ row_num;
     std::cout<< "The average col num is: "<< mean_col_num << std::endl;
+    // Run and time CPU reference implementation (single run)
+    {
+        auto cpu_start = std::chrono::high_resolution_clock::now();
+        spmv_cpu_kernel(row_offset, col_index, value, x, y_res, row_num);
+        auto cpu_stop = std::chrono::high_resolution_clock::now();
+        double cpu_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(cpu_stop - cpu_start).count();
+        std::cout << "CPU SpMV time = " << cpu_ms << " ms" << std::endl;
+    }
 
     // const int THREADS_PER_VECTOR = 32;
     // const unsigned int VECTORS_PER_BLOCK  = 256 / THREADS_PER_VECTOR;
@@ -285,7 +299,12 @@ int main(int argc, char **argv)
     // const unsigned int NUM_BLOCKS = static_cast<unsigned int>((row_num + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
     // My_spmv_csr_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR> <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> 
     //     (row_num, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
-    
+
+    // Time custom kernel over `iter` iterations using CUDA events
+    cudaEvent_t kstart, kstop;
+    checkCudaErrors(cudaEventCreate(&kstart));
+    checkCudaErrors(cudaEventCreate(&kstop));
+    checkCudaErrors(cudaEventRecord(kstart));
     for(int i=0; i<iter; i++){
         if(mean_col_num <= 2){
             const int THREADS_PER_VECTOR = 2;
@@ -323,6 +342,14 @@ int main(int argc, char **argv)
                 (row_num, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
         }
     }
+    checkCudaErrors(cudaEventRecord(kstop));
+    checkCudaErrors(cudaEventSynchronize(kstop));
+    float kernel_ms = 0.0f;
+    checkCudaErrors(cudaEventElapsedTime(&kernel_ms, kstart, kstop));
+    std::cout << "Custom kernel total time (" << iter << " iters) = " << kernel_ms << " ms, avg = " << (kernel_ms / iter) << " ms/iter" << std::endl;
+    checkCudaErrors(cudaEventDestroy(kstart));
+    checkCudaErrors(cudaEventDestroy(kstop));
+
     checkCudaErrors(cudaMemcpy(y.data(), d_y, row_num*sizeof(float), cudaMemcpyDeviceToHost));
 
     // cusparse spmv
@@ -354,11 +381,23 @@ int main(int argc, char **argv)
     CHECK_CUDA( cudaMalloc(&dBuffer, bufferSize) )
 
     // execute SpMV
+    // Time cuSPARSE SpMV over `iter` iterations using CUDA events
+    cudaEvent_t sstart, sstop;
+    checkCudaErrors(cudaEventCreate(&sstart));
+    checkCudaErrors(cudaEventCreate(&sstop));
+    checkCudaErrors(cudaEventRecord(sstart));
     for(int i=0; i<iter; i++){
         CHECK_CUSPARSE( cusparseSpMV(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
                                     &alpha, matA, vecX, &beta, vecY, CUDA_R_32F,
                                     CUSPARSE_SPMV_ALG_DEFAULT, dBuffer) )
     }
+    checkCudaErrors(cudaEventRecord(sstop));
+    checkCudaErrors(cudaEventSynchronize(sstop));
+    float cusparse_ms = 0.0f;
+    checkCudaErrors(cudaEventElapsedTime(&cusparse_ms, sstart, sstop));
+    std::cout << "cuSPARSE total time (" << iter << " iters) = " << cusparse_ms << " ms, avg = " << (cusparse_ms / iter) << " ms/iter" << std::endl;
+    checkCudaErrors(cudaEventDestroy(sstart));
+    checkCudaErrors(cudaEventDestroy(sstop));
 
     // destroy matrix/vector descriptors
     CHECK_CUSPARSE( cusparseDestroySpMat(matA) )
