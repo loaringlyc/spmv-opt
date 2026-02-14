@@ -1,16 +1,19 @@
-mkdir -p tgz
-cd tgz
+mkdir -p tmp
+cd tmp
 
 # download
 for i in `cat ../data_urls.txt`; do echo $i; wget $i; done
 
 # Unpack
-for f in ./*.tar.gz; do gunzip $i.tar.gz; tar -xvf $i.tar; rm $i.tar; done
+for f in ./*.tar.gz; do
+  [ -f "$f" ] || continue
+  echo "Unpacking $f"
+  tar -xzf "$f"
+done
 
 # Relocate
-mkdir -p ../matrix
 for i in `find . -name *.mtx`; do echo $i; mv $i ../matrix/; done
 
 # Cleanup
 cd ..
-rm -rf tgz
+rm -rf tmp
