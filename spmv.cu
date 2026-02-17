@@ -253,6 +253,20 @@ int main(int argc, char **argv)
     int iter = 2000;
     readMtxFile(is_weighted, row_num, nnz_num, row_offset.data(), col_index.data(), value.data(), file);
 
+    // Print matrix basic information: rows, cols, nnz, mean/variance of nnz per row
+    {
+        long long nnz_ll = nnz_num;
+        double mean = static_cast<double>(nnz_ll) / static_cast<double>(row_num);
+        double var = 0.0;
+        for (int i = 0; i < row_num; ++i) {
+            double r = static_cast<double>(row_offset[i+1] - row_offset[i]);
+            var += (r - mean) * (r - mean);
+        }
+        var = var / static_cast<double>(row_num);
+        std::cout << "Matrix: rows=" << row_num << " cols=" << col_num << " nnz=" << nnz_num << std::endl;
+        std::cout << "Mean nnz/row=" << mean << " Variance nnz/row=" << var << std::endl;
+    }
+
     // check input
     // std::cout<<" The row_offset is: "<<std::endl;
     // vec_print<int>(row_offset);
