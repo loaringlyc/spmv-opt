@@ -1,5 +1,6 @@
 https://www.cise.ufl.edu/research/sparse/MM/Shyy/shyy41.tar.gz
 https://www.cise.ufl.edu/research/sparse/MM/Andrianov/mip1.tar.gz
+https://www.cise.ufl.edu/research/sparse/MM/HB/ash608.tar.gz
 https://www.cise.ufl.edu/research/sparse/MM/PARSEC/Si41Ge41H72.tar.gz
 https://www.cise.ufl.edu/research/sparse/MM/PARSEC/Ga41As41H72.tar.gz
 https://www.cise.ufl.edu/research/sparse/MM/Williams/webbase-1M.tar.gz

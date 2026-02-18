@@ -153,11 +153,13 @@ void readMtxFile(int is_weighted, int n, int m,
 // device end tool
 template <unsigned int WarpSize>
 __device__ __forceinline__ float warpReduceSum(float sum) {
-    if (WarpSize >= 32)sum += __shfl_down_sync(0xffffffff, sum, 16); // 0-16, 1-17, 2-18, etc.
-    if (WarpSize >= 16)sum += __shfl_down_sync(0xffffffff, sum, 8);// 0-8, 1-9, 2-10, etc.
-    if (WarpSize >= 8)sum += __shfl_down_sync(0xffffffff, sum, 4);// 0-4, 1-5, 2-6, etc.
-    if (WarpSize >= 4)sum += __shfl_down_sync(0xffffffff, sum, 2);// 0-2, 1-3, 4-6, 5-7, etc.
-    if (WarpSize >= 2)sum += __shfl_down_sync(0xffffffff, sum, 1);// 0-1, 2-3, 4-5, etc.
+    // IMPORTANT: for sub-warp reductions (WarpSize < 32), constrain shuffle width
+    // to avoid cross-vector contamination.
+    if (WarpSize >= 32) sum += __shfl_down_sync(0xffffffff, sum, 16, WarpSize);
+    if (WarpSize >= 16) sum += __shfl_down_sync(0xffffffff, sum, 8,  WarpSize);
+    if (WarpSize >= 8)  sum += __shfl_down_sync(0xffffffff, sum, 4,  WarpSize);
+    if (WarpSize >= 4)  sum += __shfl_down_sync(0xffffffff, sum, 2,  WarpSize);
+    if (WarpSize >= 2)  sum += __shfl_down_sync(0xffffffff, sum, 1,  WarpSize);
     return sum;
 }
 
@@ -190,6 +192,78 @@ __global__ void My_spmv_csr_kernel(const IndexType row_num,
         if (thread_lane == 0){
             y[row_id] = sum;
         }   
+    }
+}
+
+// Bucketed CSR SpMV: each "vector" processes one row, but rows are provided by an index list.
+template <typename IndexType, typename ValueType, unsigned int VECTORS_PER_BLOCK, unsigned int THREADS_PER_VECTOR>
+__global__ void My_spmv_csr_bucket_kernel(const IndexType bucket_row_num,
+                       const IndexType * __restrict__ row_ids,
+                       const IndexType * __restrict__ A_row_offset,
+                       const IndexType * __restrict__ A_col_index,
+                       const ValueType * __restrict__ A_value,
+                       const ValueType * __restrict__ x,
+                       ValueType * __restrict__ y)
+{
+    const IndexType THREADS_PER_BLOCK = VECTORS_PER_BLOCK * THREADS_PER_VECTOR;
+    const IndexType vector_id   = (THREADS_PER_BLOCK * blockIdx.x + threadIdx.x) / THREADS_PER_VECTOR;
+    const IndexType thread_lane = threadIdx.x & (THREADS_PER_VECTOR - 1);
+
+    if (vector_id < bucket_row_num) {
+        const IndexType row_id = row_ids[vector_id];
+        const IndexType row_start = A_row_offset[row_id];
+        const IndexType row_end   = A_row_offset[row_id + 1];
+
+        ValueType sum = 0;
+        for (IndexType jj = row_start + thread_lane; jj < row_end; jj += THREADS_PER_VECTOR) {
+            sum += A_value[jj] * x[A_col_index[jj]];
+        }
+
+        sum = warpReduceSum<THREADS_PER_VECTOR>(sum);
+        if (thread_lane == 0) {
+            y[row_id] = sum;
+        }
+    }
+}
+
+// Long-row kernel: one CTA (block) per row to better utilize threads on very long rows.
+template <int BLOCK_SIZE>
+__global__ void My_spmv_csr_block_per_row_kernel(const int bucket_row_num,
+                       const int * __restrict__ row_ids,
+                       const int * __restrict__ A_row_offset,
+                       const int * __restrict__ A_col_index,
+                       const float * __restrict__ A_value,
+                       const float * __restrict__ x,
+                       float * __restrict__ y)
+{
+    const int bucket_row_idx = blockIdx.x;
+    if (bucket_row_idx >= bucket_row_num) return;
+
+    const int row_id = row_ids[bucket_row_idx];
+    const int row_start = A_row_offset[row_id];
+    const int row_end   = A_row_offset[row_id + 1];
+
+    float thread_sum = 0.0f;
+    for (int jj = row_start + threadIdx.x; jj < row_end; jj += BLOCK_SIZE) {
+        thread_sum += A_value[jj] * x[A_col_index[jj]];
+    }
+
+    // Block reduction (BLOCK_SIZE must be multiple of 32)
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    float warp_sum = warpReduceSum<32>(thread_sum);
+
+    __shared__ float warp_sums[BLOCK_SIZE / 32];
+    if (lane == 0) warp_sums[warp_id] = warp_sum;
+    __syncthreads();
+
+    float block_sum = 0.0f;
+    if (warp_id == 0) {
+        block_sum = (lane < (BLOCK_SIZE / 32)) ? warp_sums[lane] : 0.0f;
+        block_sum = warpReduceSum<32>(block_sum);
+        if (lane == 0) {
+            y[row_id] = block_sum;
+        }
     }
 }
 
@@ -295,9 +369,61 @@ int main(int argc, char **argv)
     checkCudaErrors(cudaMemcpy( d_x, x.data(), col_num*sizeof(float), cudaMemcpyHostToDevice));
     
     // spmv
-    // 32 thread for a row
-    int mean_col_num = (nnz_num + (row_num - 1))/ row_num;
-    std::cout<< "The average col num is: "<< mean_col_num << std::endl;
+    // Basic stats
+    int mean_col_num = (nnz_num + (row_num - 1)) / row_num;
+    std::cout << "The average col num is: " << mean_col_num << std::endl;
+
+    // Build row-length buckets for better load balance
+    // Buckets: [1], [2], [3-4], [5-8], [9-16], [17-32], [>32]
+    vector<int> bucket_1;
+    vector<int> bucket_2;
+    vector<int> bucket_4;
+    vector<int> bucket_8;
+    vector<int> bucket_16;
+    vector<int> bucket_32;
+    vector<int> bucket_long;
+    bucket_1.reserve(row_num);
+    bucket_2.reserve(row_num);
+    bucket_4.reserve(row_num);
+    bucket_8.reserve(row_num);
+    bucket_16.reserve(row_num);
+    bucket_32.reserve(row_num);
+    bucket_long.reserve(row_num);
+
+    for (int r = 0; r < row_num; r++) {
+        int row_nnz = row_offset[r + 1] - row_offset[r];
+        if (row_nnz <= 1) bucket_1.push_back(r);
+        else if (row_nnz == 2) bucket_2.push_back(r);
+        else if (row_nnz <= 4) bucket_4.push_back(r);
+        else if (row_nnz <= 8) bucket_8.push_back(r);
+        else if (row_nnz <= 16) bucket_16.push_back(r);
+        else if (row_nnz <= 32) bucket_32.push_back(r);
+        else bucket_long.push_back(r);
+    }
+    std::cout << "Bucket sizes: "
+              << "b1=" << bucket_1.size() << ", "
+              << "b2=" << bucket_2.size() << ", "
+              << "b4=" << bucket_4.size() << ", "
+              << "b8=" << bucket_8.size() << ", "
+              << "b16=" << bucket_16.size() << ", "
+              << "b32=" << bucket_32.size() << ", "
+              << "blong=" << bucket_long.size() << std::endl;
+
+    auto alloc_and_copy_rows = [&](const vector<int>& host_rows) -> int* {
+        if (host_rows.empty()) return nullptr;
+        int* d_rows = nullptr;
+        checkCudaErrors(cudaMalloc(&d_rows, host_rows.size() * sizeof(int)));
+        checkCudaErrors(cudaMemcpy(d_rows, host_rows.data(), host_rows.size() * sizeof(int), cudaMemcpyHostToDevice));
+        return d_rows;
+    };
+
+    int* d_bucket_1 = alloc_and_copy_rows(bucket_1);
+    int* d_bucket_2 = alloc_and_copy_rows(bucket_2);
+    int* d_bucket_4 = alloc_and_copy_rows(bucket_4);
+    int* d_bucket_8 = alloc_and_copy_rows(bucket_8);
+    int* d_bucket_16 = alloc_and_copy_rows(bucket_16);
+    int* d_bucket_32 = alloc_and_copy_rows(bucket_32);
+    int* d_bucket_long = alloc_and_copy_rows(bucket_long);
     // Run and time CPU reference implementation (single run)
     {
         auto cpu_start = std::chrono::high_resolution_clock::now();
@@ -314,46 +440,61 @@ int main(int argc, char **argv)
     // My_spmv_csr_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR> <<<NUM_BLOCKS, THREADS_PER_BLOCK>>> 
     //     (row_num, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
 
-    // Time custom kernel over `iter` iterations using CUDA events
+    // Time bucketed custom kernels over `iter` iterations using CUDA events
     cudaEvent_t kstart, kstop;
     checkCudaErrors(cudaEventCreate(&kstart));
     checkCudaErrors(cudaEventCreate(&kstop));
     checkCudaErrors(cudaEventRecord(kstart));
     for(int i=0; i<iter; i++){
-        if(mean_col_num <= 2){
+        // For each bucket, keep 256 threads/block and adjust vectors-per-block.
+        // THREADS_PER_VECTOR must be power-of-two and <= 32.
+        if (!bucket_1.empty()) {
+            const int THREADS_PER_VECTOR = 1;
+            const unsigned int VECTORS_PER_BLOCK = 256 / THREADS_PER_VECTOR;
+            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((bucket_1.size() + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
+            My_spmv_csr_bucket_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR>
+                <<<NUM_BLOCKS, 256>>>(static_cast<int>(bucket_1.size()), d_bucket_1, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
+        }
+        if (!bucket_2.empty()) {
             const int THREADS_PER_VECTOR = 2;
-            const unsigned int VECTORS_PER_BLOCK  = 128;
-            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((row_num + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
-            My_spmv_csr_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR> <<<NUM_BLOCKS, 256>>> 
-                (row_num, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
+            const unsigned int VECTORS_PER_BLOCK = 256 / THREADS_PER_VECTOR;
+            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((bucket_2.size() + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
+            My_spmv_csr_bucket_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR>
+                <<<NUM_BLOCKS, 256>>>(static_cast<int>(bucket_2.size()), d_bucket_2, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
         }
-        else if(mean_col_num > 2 && mean_col_num <= 4){
+        if (!bucket_4.empty()) {
             const int THREADS_PER_VECTOR = 4;
-            const unsigned int VECTORS_PER_BLOCK  = 64;
-            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((row_num + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
-            My_spmv_csr_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR> <<<NUM_BLOCKS, 256>>> 
-                (row_num, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
+            const unsigned int VECTORS_PER_BLOCK = 256 / THREADS_PER_VECTOR;
+            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((bucket_4.size() + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
+            My_spmv_csr_bucket_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR>
+                <<<NUM_BLOCKS, 256>>>(static_cast<int>(bucket_4.size()), d_bucket_4, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
         }
-        else if(mean_col_num > 4 && mean_col_num <= 8){
+        if (!bucket_8.empty()) {
             const int THREADS_PER_VECTOR = 8;
-            const unsigned int VECTORS_PER_BLOCK  = 32;
-            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((row_num + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
-            My_spmv_csr_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR> <<<NUM_BLOCKS, 256>>> 
-                (row_num, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
+            const unsigned int VECTORS_PER_BLOCK = 256 / THREADS_PER_VECTOR;
+            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((bucket_8.size() + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
+            My_spmv_csr_bucket_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR>
+                <<<NUM_BLOCKS, 256>>>(static_cast<int>(bucket_8.size()), d_bucket_8, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
         }
-        else if(mean_col_num > 8 && mean_col_num <= 16){
+        if (!bucket_16.empty()) {
             const int THREADS_PER_VECTOR = 16;
-            const unsigned int VECTORS_PER_BLOCK  = 16;
-            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((row_num + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
-            My_spmv_csr_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR> <<<NUM_BLOCKS, 256>>> 
-                (row_num, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
+            const unsigned int VECTORS_PER_BLOCK = 256 / THREADS_PER_VECTOR;
+            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((bucket_16.size() + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
+            My_spmv_csr_bucket_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR>
+                <<<NUM_BLOCKS, 256>>>(static_cast<int>(bucket_16.size()), d_bucket_16, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
         }
-        else if(mean_col_num > 16){
+        if (!bucket_32.empty()) {
             const int THREADS_PER_VECTOR = 32;
-            const unsigned int VECTORS_PER_BLOCK  = 8;
-            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((row_num + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
-            My_spmv_csr_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR> <<<NUM_BLOCKS, 256>>> 
-                (row_num, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
+            const unsigned int VECTORS_PER_BLOCK = 256 / THREADS_PER_VECTOR;
+            const unsigned int NUM_BLOCKS = static_cast<unsigned int>((bucket_32.size() + (VECTORS_PER_BLOCK - 1)) / VECTORS_PER_BLOCK);
+            My_spmv_csr_bucket_kernel<int, float, VECTORS_PER_BLOCK, THREADS_PER_VECTOR>
+                <<<NUM_BLOCKS, 256>>>(static_cast<int>(bucket_32.size()), d_bucket_32, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
+        }
+        if (!bucket_long.empty()) {
+            const int BLOCK_SIZE = 256;
+            const unsigned int NUM_BLOCKS = static_cast<unsigned int>(bucket_long.size());
+            My_spmv_csr_block_per_row_kernel<BLOCK_SIZE>
+                <<<NUM_BLOCKS, BLOCK_SIZE>>>(static_cast<int>(bucket_long.size()), d_bucket_long, d_A_row_offset, d_A_col_index, d_A_value, d_x, d_y);
         }
     }
     checkCudaErrors(cudaEventRecord(kstop));
@@ -437,6 +578,13 @@ int main(int argc, char **argv)
     }
 
     // Free Memory
+    if (d_bucket_1) cudaFree(d_bucket_1);
+    if (d_bucket_2) cudaFree(d_bucket_2);
+    if (d_bucket_4) cudaFree(d_bucket_4);
+    if (d_bucket_8) cudaFree(d_bucket_8);
+    if (d_bucket_16) cudaFree(d_bucket_16);
+    if (d_bucket_32) cudaFree(d_bucket_32);
+    if (d_bucket_long) cudaFree(d_bucket_long);
     cudaFree(d_A_row_offset);
     cudaFree(d_A_col_index);
     cudaFree(d_A_value);
